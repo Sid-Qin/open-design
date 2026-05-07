@@ -1336,23 +1336,34 @@ export async function startServer({ port = 7456, host = process.env.OD_BIND_HOST
     if (webPort && webPort !== resolvedPort) ports.push(webPort);
     const schemes = ['http', 'https'];
     const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
-    return new Set([
-      ...ports.flatMap((p) => [
+    return new Set(
+      ports.flatMap((p) => [
         ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}:${p}`)),
         // When bound to a specific non-loopback address (e.g. Tailscale,
         // LAN IP, or 0.0.0.0), allow browser requests from that address
         // too so the documented --host escape hatch remains usable.
         ...schemes.map((s) => `${s}://${host}:${p}`),
       ]),
-      // Some browser builds (observed on Chrome on Windows under certain
-      // localhost-with-non-standard-port profiles, issue #733) serialize
-      // the Origin header without the port, e.g. `http://127.0.0.1`
-      // instead of `http://127.0.0.1:6313`. The cross-origin policy is
-      // still loopback-only — port-less means "the same origin's host
-      // without a port" — so accepting these portless variants doesn't
-      // widen the trust boundary, just makes the matcher tolerant of
-      // how individual browsers serialize the header. Without this,
-      // every /api request from such a browser dies with 403.
+    );
+  }
+
+  // Portless variants admitted only when the browser itself attests the
+  // request is same-origin (see middleware below). Issue #733: some
+  // browser builds (observed on Chrome on Windows with localhost on a
+  // non-standard port) serialize Origin without the port, e.g.
+  // `http://127.0.0.1` instead of `http://127.0.0.1:6313`. We can't
+  // distinguish that from a real default-port `:80`/`:443` page on the
+  // same host using Origin alone, so we additionally require
+  // `Sec-Fetch-Site: same-origin` — a forbidden-header (Sec-* prefix)
+  // that JavaScript cannot set, and which the browser only emits when
+  // the request initiator's full origin (scheme + host + port) matches
+  // the daemon's. A default-port localhost page calling cross-port to
+  // the daemon would get `same-site` (or `cross-site`), not
+  // `same-origin`, so the cross-port protection is preserved.
+  function buildPortlessAllowedOrigins() {
+    const schemes = ['http', 'https'];
+    const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
+    return new Set([
       ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}`)),
       ...schemes.map((s) => `${s}://${host}`),
     ]);
@@ -1392,10 +1403,17 @@ export async function startServer({ port = 7456, host = process.env.OD_BIND_HOST
       return res.status(403).json({ error: 'Server initializing' });
     }
 
-    if (!buildAllowedOrigins().has(String(origin))) {
-      return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+    const originStr = String(origin);
+    if (buildAllowedOrigins().has(originStr)) return next();
+    // Issue #733 fallback: only when the browser attests same-origin via
+    // the forbidden Sec-Fetch-Site header. See buildPortlessAllowedOrigins().
+    if (
+      req.headers['sec-fetch-site'] === 'same-origin' &&
+      buildPortlessAllowedOrigins().has(originStr)
+    ) {
+      return next();
     }
-    next();
+    return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
   });
   const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
   configureConnectorCredentialStore(new FileConnectorCredentialStore(RUNTIME_DATA_DIR));
@@ -5139,16 +5157,28 @@ export function isLocalSameOrigin(req, port) {
   if (origin == null || origin === '') return true;
 
   const schemes = ['http', 'https'];
-  const allowedOrigins = new Set([
-    ...ports.flatMap((p) => [
+  const allowedOrigins = new Set(
+    ports.flatMap((p) => [
       ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}:${p}`)),
       ...schemes.map((s) => `${s}://${bindHost}:${p}`),
     ]),
-    // Match `buildAllowedOrigins()`: accept the portless serializations
-    // some browsers emit on localhost (issue #733). Loopback-only, so
-    // the trust boundary doesn't change.
+  );
+  const originStr = String(origin);
+  if (allowedOrigins.has(originStr)) return true;
+
+  // Issue #733: tolerate portless Origin serialization (Chrome on
+  // Windows under certain localhost-with-non-standard-port profiles)
+  // ONLY when the browser attests the request is same-origin via the
+  // forbidden Sec-Fetch-Site header. JavaScript cannot set Sec-*
+  // headers, and the browser emits `same-origin` only when the
+  // initiator's full scheme+host+port matches the request target — so
+  // a default-port localhost page calling cross-port to the daemon
+  // gets `same-site`/`cross-site` (not `same-origin`) and stays
+  // blocked. See buildPortlessAllowedOrigins() in startServer().
+  if (req.headers['sec-fetch-site'] !== 'same-origin') return false;
+  const portlessAllowed = new Set([
     ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}`)),
     ...schemes.map((s) => `${s}://${bindHost}`),
   ]);
-  return allowedOrigins.has(String(origin));
+  return portlessAllowed.has(originStr);
 }

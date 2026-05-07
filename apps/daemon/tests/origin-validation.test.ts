@@ -2,11 +2,13 @@
 import http from 'node:http';
 import express from 'express';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { isLocalSameOrigin } from '../src/server';
 
 /**
  * Replicate the origin validation middleware from server.ts exactly
  * as it appears in the real daemon, so we test the actual logic
- * including OD_WEB_PORT, Origin: null scoping, and non-loopback host.
+ * including OD_WEB_PORT, Origin: null scoping, non-loopback host, and
+ * the issue #733 portless-Origin fallback gated on Sec-Fetch-Site.
  */
 function createOriginMiddleware(resolvedPort, host = '127.0.0.1') {
   // Routes that serve content to sandboxed iframes (Origin: null) for
@@ -32,20 +34,27 @@ function createOriginMiddleware(resolvedPort, host = '127.0.0.1') {
     if (webPort && webPort !== resolvedPort) ports.push(webPort);
     const schemes = ['http', 'https'];
     const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
-    const allowedOrigins = new Set([
-      ...ports.flatMap((p) => [
+    const allowedOrigins = new Set(
+      ports.flatMap((p) => [
         ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}:${p}`)),
         ...schemes.map((s) => `${s}://${host}:${p}`),
       ]),
-      // Mirror buildAllowedOrigins(): accept the portless serializations
-      // some browsers emit on localhost (issue #733).
+    );
+    const originStr = String(origin);
+    if (allowedOrigins.has(originStr)) return next();
+    // Issue #733: portless Origin tolerated only when the browser
+    // attests same-origin via the forbidden Sec-Fetch-Site header.
+    const portlessAllowed = new Set([
       ...schemes.flatMap((s) => loopbackHosts.map((h) => `${s}://${h}`)),
       ...schemes.map((s) => `${s}://${host}`),
     ]);
-    if (!allowedOrigins.has(String(origin))) {
-      return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+    if (
+      req.headers['sec-fetch-site'] === 'same-origin' &&
+      portlessAllowed.has(originStr)
+    ) {
+      return next();
     }
-    next();
+    return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
   };
 }
 
@@ -155,33 +164,43 @@ describe('daemon origin validation middleware', () => {
   // Some browser builds (observed on Chrome under Windows when serving
   // localhost on a non-standard port) send the Origin header without
   // the port — `http://127.0.0.1` instead of `http://127.0.0.1:6313`.
-  // The middleware must accept these portless loopback variants so
-  // every /api request from such a browser doesn't 403.
+  // We tolerate that, but ONLY when the browser additionally attests
+  // the request is same-origin via `Sec-Fetch-Site: same-origin`. That
+  // header is browser-set, JS cannot write `Sec-*` (forbidden header),
+  // and the browser only emits `same-origin` when the page's full
+  // scheme+host+port matches the request target. A real default-port
+  // (`:80`/`:443`) localhost page calling cross-port to the daemon
+  // would emit `same-site` (or `cross-site`), so the cross-port
+  // protection survives.
 
-  it('allows portless Origin: http://127.0.0.1 (loopback, no port)', async () => {
+  it('allows portless Origin: http://127.0.0.1 when Sec-Fetch-Site: same-origin', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: 'http://127.0.0.1',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(res.status).toBe(200);
   });
 
-  it('allows portless Origin: http://localhost (loopback, no port)', async () => {
+  it('allows portless Origin: http://localhost when Sec-Fetch-Site: same-origin', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: 'http://localhost',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(res.status).toBe(200);
   });
 
-  it('allows portless Origin: http://[::1] (IPv6 loopback, no port)', async () => {
+  it('allows portless Origin: http://[::1] when Sec-Fetch-Site: same-origin', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: 'http://[::1]',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(res.status).toBe(200);
   });
 
-  it('allows portless Origin via HTTPS', async () => {
+  it('allows portless Origin via HTTPS when Sec-Fetch-Site: same-origin', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: 'https://127.0.0.1',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(res.status).toBe(200);
   });
@@ -189,6 +208,62 @@ describe('daemon origin validation middleware', () => {
   it('still blocks non-loopback portless Origins (security boundary preserved)', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: 'http://evil.com',
+      headers: { 'sec-fetch-site': 'same-origin' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  // Negative cases for the default-port-localhost CORS bypass that an
+  // unconditional portless allowlist would have introduced. These
+  // simulate a default-port (`:80`/`:443`) local page calling the
+  // daemon cross-port; the browser sends a portless Origin but
+  // Sec-Fetch-Site reflects the actual cross-port relationship.
+
+  it('blocks portless Origin: http://localhost without Sec-Fetch-Site (cross-port default-port page)', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: 'http://localhost',
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks portless Origin: http://127.0.0.1 with Sec-Fetch-Site: same-site (cross-port loopback)', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: 'http://127.0.0.1',
+      headers: { 'sec-fetch-site': 'same-site' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks portless Origin with Sec-Fetch-Site: cross-site', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: 'http://localhost',
+      headers: { 'sec-fetch-site': 'cross-site' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks portless HTTPS Origin without Sec-Fetch-Site (`:443` default-port page)', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: 'https://localhost',
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks default-port localhost POST without Sec-Fetch-Site', async () => {
+    const res = await request(port, 'POST', '/api/projects', {
+      origin: 'http://localhost',
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('does not let Sec-Fetch-Site: same-origin admit a non-loopback portless Origin', async () => {
+    // Forbidden-header spoof attempt by an attacker: even if Sec-Fetch-Site
+    // somehow appears as `same-origin`, the Origin still has to be in the
+    // portless loopback set. evil.com is not.
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: 'http://evil.com',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(res.status).toBe(403);
   });
@@ -368,10 +443,102 @@ describe('origin validation: non-loopback bind host', () => {
     expect(res.status).toBe(403);
   });
 
-  it('allows portless Origin from the non-loopback bind host (issue #733)', async () => {
+  it('allows portless Origin from the non-loopback bind host with Sec-Fetch-Site: same-origin (issue #733)', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: `http://${nonLoopbackHost}`,
+      headers: { 'sec-fetch-site': 'same-origin' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('blocks portless Origin from the non-loopback bind host without Sec-Fetch-Site (default-port LAN page)', async () => {
     const res = await request(port, 'GET', '/api/projects', {
       origin: `http://${nonLoopbackHost}`,
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks portless Origin from non-loopback bind host with Sec-Fetch-Site: same-site', async () => {
+    const res = await request(port, 'GET', '/api/projects', {
+      origin: `http://${nonLoopbackHost}`,
+      headers: { 'sec-fetch-site': 'same-site' },
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('isLocalSameOrigin (exported helper, issue #733 negative cases)', () => {
+  const PORT = 6313;
+  const HOST_HEADER = `127.0.0.1:${PORT}`;
+
+  function makeReq({ origin, secFetchSite, host = HOST_HEADER } = {}) {
+    return {
+      headers: {
+        host,
+        ...(origin !== undefined ? { origin } : {}),
+        ...(secFetchSite !== undefined ? { 'sec-fetch-site': secFetchSite } : {}),
+      },
+    };
+  }
+
+  it('accepts exact port-bearing same-origin', () => {
+    expect(isLocalSameOrigin(makeReq({ origin: `http://127.0.0.1:${PORT}` }), PORT)).toBe(true);
+  });
+
+  it('rejects unknown Host (DNS rebinding guard)', () => {
+    expect(
+      isLocalSameOrigin(
+        makeReq({ origin: `http://127.0.0.1:${PORT}`, host: 'attacker.example' }),
+        PORT,
+      ),
+    ).toBe(false);
+  });
+
+  it('accepts no-Origin browser-less client when Host is valid', () => {
+    expect(isLocalSameOrigin(makeReq({}), PORT)).toBe(true);
+  });
+
+  it('accepts portless Origin only when Sec-Fetch-Site: same-origin', () => {
+    expect(
+      isLocalSameOrigin(
+        makeReq({ origin: 'http://127.0.0.1', secFetchSite: 'same-origin' }),
+        PORT,
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects portless Origin without Sec-Fetch-Site (default-port localhost page)', () => {
+    expect(isLocalSameOrigin(makeReq({ origin: 'http://localhost' }), PORT)).toBe(false);
+  });
+
+  it('rejects portless Origin with Sec-Fetch-Site: same-site (cross-port loopback)', () => {
+    expect(
+      isLocalSameOrigin(
+        makeReq({ origin: 'http://127.0.0.1', secFetchSite: 'same-site' }),
+        PORT,
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects portless Origin with Sec-Fetch-Site: cross-site', () => {
+    expect(
+      isLocalSameOrigin(
+        makeReq({ origin: 'http://localhost', secFetchSite: 'cross-site' }),
+        PORT,
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects non-loopback portless Origin even with Sec-Fetch-Site: same-origin', () => {
+    expect(
+      isLocalSameOrigin(
+        makeReq({ origin: 'http://evil.com', secFetchSite: 'same-origin' }),
+        PORT,
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects portless HTTPS Origin without Sec-Fetch-Site (`:443` default-port page)', () => {
+    expect(isLocalSameOrigin(makeReq({ origin: 'https://localhost' }), PORT)).toBe(false);
   });
 });

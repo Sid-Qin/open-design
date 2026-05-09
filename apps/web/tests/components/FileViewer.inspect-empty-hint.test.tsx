@@ -158,4 +158,102 @@ describe('FileViewer Inspect/Picker empty-annotation hint (#890)', () => {
     expect(screen.getByTestId('inspect-empty-hint-no-targets').textContent ?? '')
       .toMatch(/comment on/i);
   });
+
+  it('keeps the instructive default copy in place until the iframe broadcasts a target list (#1005 review)', () => {
+    // Regression coverage for the lefarcen review's P2 race: with
+    // the size-only check, an annotated artifact would briefly
+    // flash the no-targets copy in the microsecond gap between
+    // mode-on and the bridge's first `od:comment-targets`
+    // broadcast. The targetsState tri-state pins the contract:
+    // until we hear from the iframe, we render the instructive
+    // default — never the empty-state.
+    render(
+      <FileViewer
+        projectId="project-1"
+        file={htmlFile()}
+        liveHtml="<html><body><main data-od-id='hero'>Hero</main></body></html>"
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('inspect-mode-toggle'));
+
+    // No iframe broadcast simulated — targetsState should still be
+    // 'unknown', so the empty-state copy must not render.
+    expect(screen.queryByTestId('inspect-empty-hint-no-targets')).toBeNull();
+    // The instructive default copy DOES render — the user gets a
+    // hint either way, just not the misleading empty-state one.
+    expect(screen.queryByTestId('inspect-empty-hint')).toBeTruthy();
+  });
+
+  it('shows the Picker empty-state hint after the user dismissed the Inspect hint earlier (#1005 review)', async () => {
+    // P2 from the lefarcen review: openHintBox was a single
+    // global boolean, so dismissing the hint in Inspect would
+    // silently suppress it on a later Picker visit even when
+    // the artifact has zero annotated elements. After the fix,
+    // entering Tweaks/Picker resets the dismissal so the
+    // empty-state affordance still has a chance to render.
+    render(
+      <FileViewer
+        projectId="project-1"
+        file={htmlFile()}
+        liveHtml="<html><body><h1>No annotations</h1></body></html>"
+      />,
+    );
+
+    // 1. Enter Inspect, broadcast empty targets, dismiss the hint.
+    fireEvent.click(screen.getByTestId('inspect-mode-toggle'));
+    await act(async () => {
+      postTargetsFromIframe([]);
+    });
+    expect(screen.queryByTestId('inspect-empty-hint-no-targets')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Close Inspect Hint'));
+    expect(screen.queryByTestId('inspect-empty-hint-no-targets')).toBeNull();
+
+    // 2. Toggle Inspect off, then enter Tweaks/Picker.
+    fireEvent.click(screen.getByTestId('inspect-mode-toggle'));
+    fireEvent.click(screen.getByTestId('board-mode-toggle'));
+    await act(async () => {
+      postTargetsFromIframe([]);
+    });
+
+    // The hint must come back on Picker entry — without the
+    // dismissal reset in `activateBoard`, this assertion fires
+    // and the user is back in the original "click ignored, no
+    // signal" failure mode.
+    expect(screen.queryByTestId('inspect-empty-hint-no-targets')).toBeTruthy();
+  });
+
+  it('clears inspectMode when activating Tweaks so the hint copy reads as Picker, not Inspect (#1005 review)', async () => {
+    // P3 from the lefarcen review: entering Tweaks while
+    // inspectMode was still true left both bridges active and the
+    // hint branched on `inspectMode ? 'inspect' : 'comment on'`,
+    // so the user picking Pods would still see Inspect-style copy.
+    // `activateBoard` now clears inspectMode for symmetry with
+    // the Inspect activation path that already calls
+    // `setBoardMode(false)`.
+    render(
+      <FileViewer
+        projectId="project-1"
+        file={htmlFile()}
+        liveHtml="<html><body><h1>No annotations</h1></body></html>"
+      />,
+    );
+
+    // Enter Inspect first.
+    fireEvent.click(screen.getByTestId('inspect-mode-toggle'));
+    // Then enter Tweaks (Picker default tool) without explicitly
+    // turning Inspect off — that's the trigger condition.
+    fireEvent.click(screen.getByTestId('board-mode-toggle'));
+    await act(async () => {
+      postTargetsFromIframe([]);
+    });
+
+    const banner = screen.getByTestId('inspect-empty-hint-no-targets');
+    expect(banner.textContent ?? '').toMatch(/comment on/i);
+    // Defensive: the inspect-style verb must NOT leak through —
+    // a regression that re-introduces the dual-mode state here
+    // would put both 'inspect' (from inspectMode) and 'comment
+    // on' (from the boardMode branch) in conflict.
+    expect(banner.textContent ?? '').not.toMatch(/\binspect\b/i);
+  });
 });

@@ -2909,6 +2909,17 @@ function HtmlViewer({
   const [hoveredCommentTarget, setHoveredCommentTarget] = useState<PreviewCommentSnapshot | null>(null);
   const [liveCommentTargets, setLiveCommentTargets] = useState<Map<string, PreviewCommentSnapshot>>(() => new Map());
   const liveCommentTargetsRef = useRef(liveCommentTargets);
+  // Tri-state for the empty-annotation hint banner (#890 / #1005
+  // review). `liveCommentTargets.size === 0` alone conflated "the
+  // current iframe broadcast zero targets" with "we haven't heard
+  // from the iframe yet" — annotated artifacts could briefly flash
+  // the no-targets copy on first paint before the bridge ran its
+  // initial `od:comment-targets` post. The host-side render for the
+  // hint now branches on this status: only `'empty'` shows the
+  // empty-state copy. `'unknown'` (default + on srcdoc rebuild)
+  // shows the instructive default; `'present'` shows the same
+  // instructive default (matches existing UX for annotated artifacts).
+  const [targetsState, setTargetsState] = useState<'unknown' | 'empty' | 'present'>('unknown');
   const [commentDraft, setCommentDraft] = useState('');
   // Inspect mode shares the iframe selection bridge with comment mode but
   // routes the picked element to a side panel that mutates per-element CSS
@@ -3211,6 +3222,16 @@ function HtmlViewer({
   useEffect(() => {
     if (!inspectMode && !boardMode) {
       setLiveCommentTargets((current) => (current.size > 0 ? new Map() : current));
+      // Neither selection mode is active so no banner is rendered;
+      // reset to `unknown` so the next mode entry waits for a real
+      // bridge broadcast before deciding which copy to show. This
+      // is what fixes the brief flash of empty-state copy on
+      // annotated artifacts (#1005 review): without the reset, the
+      // map starts empty when the user toggles Inspect on, and the
+      // hint container would show the no-targets copy in the
+      // microsecond gap before the iframe posts its first
+      // `od:comment-targets`.
+      setTargetsState('unknown');
       return;
     }
     function onMessage(ev: MessageEvent) {
@@ -3244,10 +3265,26 @@ function HtmlViewer({
         });
       });
       setLiveCommentTargets(next);
+      // Authoritative signal from the current iframe: empty list
+      // → no annotations exist; non-empty → at least one is
+      // resolvable. Either way we now know enough to render the
+      // correct hint copy, so leave `unknown` behind.
+      setTargetsState(next.size === 0 ? 'empty' : 'present');
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
   }, [inspectMode, boardMode, file.name]);
+
+  // Reset targetsState whenever the rendered srcdoc generation
+  // changes (file switch, manual edit save, livehtml swap, …) so
+  // the next bridge boot has a chance to broadcast before the
+  // host re-decides whether targets exist. Without this, the
+  // first frame of a fresh iframe could keep showing the previous
+  // file's `'present'` / `'empty'` verdict — stale, and confusing
+  // when the new artifact has the opposite annotation status.
+  useEffect(() => {
+    setTargetsState('unknown');
+  }, [srcDoc, file.name]);
 
   useEffect(() => {
     setActiveCommentTarget(null);
@@ -4022,6 +4059,22 @@ function HtmlViewer({
     if (nextTool) {
       setBoardTool(nextTool);
     }
+    // Inspect and Tweaks/Picker share the selection-bridge surface;
+    // leaving inspectMode on while activating Picker would render
+    // both bridges simultaneously and the empty-state hint copy
+    // would read "Click any element with `data-od-id` to tune its
+    // style" (the inspectMode branch) even though the user is now
+    // commenting. Clear inspectMode here for symmetry with the
+    // Inspect activation handler that already calls
+    // `setBoardMode(false)`. Issue #890 / #1005 review.
+    setInspectMode(false);
+    // Reset hint dismissal whenever the user enters a Picker-style
+    // surface so the empty-state affordance for #890 has a chance
+    // to render. Without this, dismissing the hint in Inspect
+    // would silently suppress it on a later Picker visit even
+    // when the artifact has zero annotated elements (which is
+    // exactly the case the hint exists to explain). #1005 review.
+    setOpenHintBox(true);
   }
 
   function queueCurrentDraft() {
@@ -4706,7 +4759,15 @@ function HtmlViewer({
               && !activeInspectTarget
               && !activeCommentTarget ? (
               <div className="inspect-empty-hint-container">
-                {liveCommentTargets.size === 0 ? (
+                {targetsState === 'empty' ? (
+                  // Only render the empty-state copy after the iframe
+                  // has authoritatively reported zero targets. Until
+                  // then `targetsState === 'unknown'` keeps the
+                  // instructive default in place, so annotated
+                  // artifacts no longer flash the wrong copy in the
+                  // microsecond gap between mode-on and the bridge's
+                  // first `od:comment-targets` broadcast (#1005
+                  // review).
                   <div
                     className="inspect-empty-hint"
                     data-testid="inspect-empty-hint-no-targets"
